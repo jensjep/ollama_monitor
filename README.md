@@ -16,6 +16,8 @@
 - **API Proxy Capability**: Can function as a proxy server for Ollama API calls
 - **System Service Support**: Can be deployed as a system daemon for long-term stable operation
 
+![dashboard](ollama_monitor_dashboard.png)
+
 ## Quick Start
 
 ### Install Dependencies
