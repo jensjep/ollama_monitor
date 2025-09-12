@@ -2,8 +2,10 @@
 # Ollama_monitor specific ignores
 log/
 *.log
+log/ollama_monitor.log
 db/
 *.db
+db/ollama_metrics.db
 
 # Docker
 .dockerignore
