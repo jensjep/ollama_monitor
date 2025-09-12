@@ -1,0 +1,18 @@
+services:
+  ollama_monitor:
+    build: .
+    ports:
+      - "3010:3010"
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./db:/app/db
+      - ./log:/app/log
+    restart: unless-stopped

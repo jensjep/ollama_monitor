@@ -11,21 +11,22 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
+import subprocess
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    filename='ollama_monitor.log'
+    filename='/app/log/ollama_monitor.log'
 )
 logger = logging.getLogger('ollama_monitor')
 
 # 配置参数
-OLLAMA_HOST = "http://localhost:11434"
-MONITOR_INTERVAL = 60  # 监控间隔(秒)
+OLLAMA_HOST = "http://host.docker.internal:11434"
+MONITOR_INTERVAL = 5  # 监控间隔(秒)   HUSK OGSÅ AT OPDATERE I JAVASCRIPT-DELEN setInterval(refreshData, XXXX)
 WEB_HOST = "0.0.0.0"
-WEB_PORT = 8080
-DB_FILE = "ollama_metrics.db"
+WEB_PORT = 3010
+DB_FILE = "/app/db/ollama_metrics.db"
 
 class OllamaMetricsDB:
     def __init__(self, db_file=DB_FILE):
@@ -54,7 +55,21 @@ class OllamaMetricsDB:
             ollama_connections INTEGER
         )
         ''')
-        
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS gpu_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            gpu_name TEXT,
+            gpu_utilization REAL,
+            gpu_memory_total REAL,
+            gpu_memory_used REAL,
+            gpu_temperature REAL,
+            gpu_power_draw REAL,
+            gpu_power_limit REAL
+        )
+        ''')
+
         # 请求日志表
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS request_logs (
@@ -114,7 +129,31 @@ class OllamaMetricsDB:
         
         conn.commit()
         conn.close()
-    
+
+    def save_gpu_metrics(self, metrics):
+        """保存GPU指标"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+        INSERT INTO gpu_metrics (
+            timestamp, gpu_name, gpu_utilization, gpu_memory_total, gpu_memory_used,
+            gpu_temperature, gpu_power_draw, gpu_power_limit
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            metrics['timestamp'],
+            metrics['gpu']['gpu_name'],
+            metrics['gpu']['gpu_utilization'],
+            metrics['gpu']['gpu_memory_total'],
+            metrics['gpu']['gpu_memory_used'],
+            metrics['gpu']['gpu_temperature'],
+            metrics['gpu']['gpu_power_draw'],
+            metrics['gpu']['gpu_power_limit']
+        ))
+
+        conn.commit()
+        conn.close()
+
     def save_models(self, timestamp, models):
         """保存模型信息"""
         conn = sqlite3.connect(self.db_file)
@@ -178,6 +217,24 @@ class OllamaMetricsDB:
         rows = cursor.fetchall()
         result = [dict(row) for row in rows]
         
+        conn.close()
+        return result
+
+    def get_recent_gpu_metrics(self, hours=24):
+        """获取最近的GPU指标"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        SELECT * FROM gpu_metrics
+        WHERE timestamp > datetime('now', ?)
+        ORDER BY timestamp
+        ''', (f'-{hours} hours',))
+
+        rows = cursor.fetchall()
+        result = [dict(row) for row in rows]
+
         conn.close()
         return result
     
@@ -326,6 +383,31 @@ class OllamaMonitor:
         
         return metrics
     
+    def get_gpu_metrics(self):
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit", "--format=csv,noheader,nounits"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True
+            )
+            values = result.stdout.strip().split(", ")
+            metrics = {
+                "gpu_name": values[0],
+                "gpu_utilization": float(values[1]),
+                "gpu_memory_used": float(values[2]),
+                "gpu_memory_total": float(values[3]),
+                "gpu_temperature": float(values[4]),
+                "gpu_power_draw": float(values[5]),
+                "gpu_power_limit": float(values[6])
+            }
+            #logger.info(f"GPU metrics: {metrics}")        # fjern hashtag for at se hvad der er målt i loggen
+            return metrics
+        except Exception as e:
+            logger.error(f"GPU metrics error: {e}")
+            return {}
+
     def get_ollama_process_info(self):
         """获取Ollama进程的资源使用情况"""
         for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
@@ -395,11 +477,14 @@ class OllamaMonitor:
                     "timestamp": timestamp,
                     "server_status": server_status,
                     "system": self.get_system_metrics(),
+                    "gpu": self.get_gpu_metrics(),
                     "ollama_process": self.get_ollama_process_info() or {},
                 }
-                
+                # logger.info(f"All metrics: {metrics}")    # fjern hashtag for at se hvad der er målt i loggen
+
                 # 保存系统指标
                 self.db.save_system_metrics(metrics)
+                self.db.save_gpu_metrics(metrics)
                 
                 # 如果服务器在线，获取并保存模型列表
                 if server_status:
@@ -595,7 +680,7 @@ document.addEventListener('DOMContentLoaded', function() {
     setupTabs();
     
     // 设置自动刷新
-    setInterval(refreshData, 60000); // 每分钟刷新一次
+    setInterval(refreshData, 5000); // 每分钟刷新一次   HUSK OGSÅ AT OPDATERE I PYTHON-DELEN MONITOR_INTERVAL = XXXX
     
     // 初始加载数据
     refreshData();
@@ -634,7 +719,7 @@ function initCharts() {
         data: {
             labels: [],
             datasets: [{
-                label: '系统CPU使用率(%)',
+                label: 'System CPU Load (%)',
                 data: [],
                 borderColor: '#3498db',
                 backgroundColor: 'rgba(52, 152, 219, 0.1)',
@@ -642,7 +727,7 @@ function initCharts() {
                 pointRadius: 0,
                 fill: true
             }, {
-                label: 'Ollama CPU使用率(%)',
+                label: 'Ollama CPU Load (%)',
                 data: [],
                 borderColor: '#e74c3c',
                 backgroundColor: 'rgba(231, 76, 60, 0.1)',
@@ -684,7 +769,7 @@ function initCharts() {
         data: {
             labels: [],
             datasets: [{
-                label: '系统内存使用率(%)',
+                label: 'System Memory Usage (%)',
                 data: [],
                 borderColor: '#2ecc71',
                 backgroundColor: 'rgba(46, 204, 113, 0.1)',
@@ -692,10 +777,68 @@ function initCharts() {
                 pointRadius: 0,
                 fill: true
             }, {
-                label: 'Ollama内存使用率(%)',
+                label: 'Ollama Memory Usage (%)',
                 data: [],
                 borderColor: '#9b59b6',
                 backgroundColor: 'rgba(155, 89, 182, 0.1)',
+                borderWidth: 2,
+                pointRadius: 0,
+                fill: true
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    ticks: {
+                        maxTicksLimit: 10
+                    }
+                },
+                y: {
+                    beginAtZero: true,
+                    max: 100
+                }
+            },
+            plugins: {
+                tooltip: {
+                    mode: 'index',
+                    intersect: false
+                },
+                legend: {
+                    position: 'top'
+                }
+            }
+        }
+    });
+    
+    // GPU Chart
+    const gpuCtx = document.getElementById('gpuChart').getContext('2d');
+    window.gpuChart = new Chart(gpuCtx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [{
+                label: 'GPU Load (%)',
+                data: [],
+                borderColor: '#3498db',
+                backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                borderWidth: 2,
+                pointRadius: 0,
+                fill: true
+            }, {
+                label: 'GPU Memory Usage (%)',
+                data: [],
+                borderColor: '#e74c3c',
+                backgroundColor: 'rgba(231, 76, 60, 0.1)',
+                borderWidth: 2,
+                pointRadius: 0,
+                fill: true
+            }, {
+                label: 'GPU Power (%)',
+                data: [],
+                borderColor: '#16a085',
+                backgroundColor: 'rgba(22, 160, 133, 0.1)',
                 borderWidth: 2,
                 pointRadius: 0,
                 fill: true
@@ -734,7 +877,7 @@ function initCharts() {
         data: {
             labels: [],
             datasets: [{
-                label: '发送流量(MB)',
+                label: 'Sent Traffic (MB)',
                 data: [],
                 borderColor: '#f39c12',
                 backgroundColor: 'rgba(243, 156, 18, 0.1)',
@@ -742,7 +885,7 @@ function initCharts() {
                 pointRadius: 0,
                 fill: true
             }, {
-                label: '接收流量(MB)',
+                label: 'Received Traffic (MB)',
                 data: [],
                 borderColor: '#16a085',
                 backgroundColor: 'rgba(22, 160, 133, 0.1)',
@@ -783,13 +926,13 @@ function initCharts() {
         data: {
             labels: [],
             datasets: [{
-                label: '输入Token',
+                label: 'Input Tokens',
                 data: [],
                 backgroundColor: 'rgba(52, 152, 219, 0.7)',
                 borderColor: 'rgba(52, 152, 219, 1)',
                 borderWidth: 1
             }, {
-                label: '输出Token',
+                label: 'Output Tokens',
                 data: [],
                 backgroundColor: 'rgba(46, 204, 113, 0.7)',
                 borderColor: 'rgba(46, 204, 113, 1)',
@@ -823,6 +966,7 @@ function initCharts() {
 // 刷新所有数据
 function refreshData() {
     fetchSystemMetrics();
+    fetchGpuMetrics();
     fetchRequestStats();
     fetchModelStats();
     fetchIpStats();
@@ -837,6 +981,17 @@ function fetchSystemMetrics() {
         .then(data => {
             updateSystemCharts(data);
             updateSystemStats(data);
+        })
+        .catch(error => console.error('获取系统指标失败:', error));
+}
+
+// Get GPU Metrics Data
+function fetchGpuMetrics() {
+    fetch('/api/metrics/gpu')
+        .then(response => response.json())
+        .then(data => {
+            updateGpuCharts(data);
+            updateGpuStats(data);
         })
         .catch(error => console.error('获取系统指标失败:', error));
 }
@@ -947,17 +1102,17 @@ function updateServerStatus() {
         .then(data => {
             const statusElement = document.getElementById('serverStatus');
             if (data.server_status) {
-                statusElement.innerHTML = '<span class="status-indicator status-up"></span>运行中';
+                statusElement.innerHTML = '<span class="status-indicator status-up"></span>Running';
                 statusElement.style.color = '#2ecc71';
             } else {
-                statusElement.innerHTML = '<span class="status-indicator status-down"></span>已停止';
+                statusElement.innerHTML = '<span class="status-indicator status-down"></span>Stopped';
                 statusElement.style.color = '#e74c3c';
             }
         })
         .catch(error => {
             console.error('获取服务器状态失败:', error);
             const statusElement = document.getElementById('serverStatus');
-            statusElement.innerHTML = '<span class="status-indicator status-down"></span>连接失败';
+            statusElement.innerHTML = '<span class="status-indicator status-down"></span>Connection Failed';
             statusElement.style.color = '#e74c3c';
         });
 }
@@ -965,8 +1120,8 @@ function updateServerStatus() {
 // 更新系统图表
 function updateSystemCharts(data) {
     // 仅保留最近24小时的数据点（假设每分钟1个数据点，最多1440个点）
-    const maxDataPoints = 1440;
-    
+    const maxDataPoints = 17280;   // Hvis man opdater hvert 5. sekund, så er det 12 gange i minuttet, 720 gange i timen, 17280 gange på 24 timer.
+
     // 提取最近的数据点
     const recentData = data.slice(-maxDataPoints);
     
@@ -1007,6 +1162,32 @@ function updateSystemCharts(data) {
     window.networkChart.update();
 }
 
+function updateGpuCharts(data) {
+    // 仅保留最近24小时的数据点（假设每分钟1个数据点，最多1440个点）
+    const maxDataPoints = 1440;
+    
+    // 提取最近的数据点
+    const recentData = data.slice(-maxDataPoints);
+    
+    // 格式化时间标签
+    const timeLabels = recentData.map(d => {
+        const date = new Date(d.timestamp);
+        return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+    });
+    
+   // GPU
+    const gpuUtilizationData = recentData.map(d => d.gpu_utilization);
+    const gpuMemoryData = recentData.map(d => d.gpu_memory_used && d.gpu_memory_total ? (d.gpu_memory_used / d.gpu_memory_total) * 100 : 0);
+    const gpuPowerData = recentData.map(d => d.gpu_power_draw && d.gpu_power_limit ? (d.gpu_power_draw / d.gpu_power_limit) * 100 : 0);
+
+    // GPU
+    window.gpuChart.data.labels = timeLabels;
+    window.gpuChart.data.datasets[0].data = gpuUtilizationData;
+    window.gpuChart.data.datasets[1].data = gpuMemoryData;
+    window.gpuChart.data.datasets[2].data = gpuPowerData;
+    window.gpuChart.update();
+}
+
 // 更新系统统计信息
 function updateSystemStats(data) {
     if (data.length > 0) {
@@ -1015,6 +1196,19 @@ function updateSystemStats(data) {
         document.getElementById('memoryUsage').innerText = latest.memory_percent.toFixed(1) + '%';
         document.getElementById('diskUsage').innerText = latest.disk_percent.toFixed(1) + '%';
         document.getElementById('ollamaConnections').innerText = latest.ollama_connections;
+    }
+}
+
+// Update GPU Stats
+function updateGpuStats(data) {
+    if (data.length > 0) {
+        const latest = data[data.length - 1];
+        document.getElementById('gpuUsage').innerText = latest.gpu_utilization ? latest.gpu_utilization.toFixed(1) + '%' : 'N/A';
+        document.getElementById('gpuName').innerText = latest.gpu_name ? latest.gpu_name : 'N/A';
+        document.getElementById('gpuMemoryUsage').innerText = latest.gpu_memory_used && latest.gpu_memory_total ? latest.gpu_memory_used.toFixed(0) + ' MB / ' + latest.gpu_memory_total.toFixed(0) + ' MB' : 'N/A';
+        document.getElementById('gpuMemoryPercent').innerText = latest.gpu_memory_used && latest.gpu_memory_total ? ((latest.gpu_memory_used / latest.gpu_memory_total) * 100).toFixed(1) + '%' : 'N/A';
+        document.getElementById('gpuPower').innerText = latest.gpu_power_draw && latest.gpu_power_limit ? latest.gpu_power_draw.toFixed(0) + ' W / ' + latest.gpu_power_limit.toFixed(0) + ' W' : 'N/A';
+        document.getElementById('gpuPwrPercent').innerText = latest.gpu_power_draw && latest.gpu_power_limit ? ((latest.gpu_power_draw / latest.gpu_power_limit) * 100).toFixed(1) + '% (' + latest.gpu_temperature.toFixed(0) + '°C)' : 'N/A';
     }
 }
 ''')
@@ -1037,89 +1231,111 @@ def get_index_template():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ollama监控系统</title>
+    <title>Ollama Monitor Dashboard</title>
     <link rel="stylesheet" href="/static/style.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
     <header>
         <div class="container">
-            <h1>Ollama监控系统</h1>
+            <h1>Ollama Monitor Dashboard</h1>
         </div>
     </header>
     
     <div class="container">
         <div class="dashboard">
             <div class="stat-card">
-                <div class="stat-title">服务器状态</div>
-                <div id="serverStatus" class="stat-value"><span class="status-indicator"></span>检查中...</div>
+                <div class="stat-title">Server Status</div>
+                <div id="serverStatus" class="stat-value"><span class="status-indicator"></span>Checking...</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">总请求数</div>
+                <div class="stat-title">Total Requests</div>
                 <div id="totalRequests" class="stat-value">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">平均响应时间</div>
+                <div class="stat-title">Average Response Time</div>
                 <div id="avgResponseTime" class="stat-value">0s</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">CPU使用率</div>
+                <div class="stat-title">CPU Usage</div>
                 <div id="cpuUsage" class="stat-value">0%</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">内存使用率</div>
+                <div class="stat-title">Memory Usage</div>
                 <div id="memoryUsage" class="stat-value">0%</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">磁盘使用率</div>
+                <div class="stat-title">Disk Usage</div>
                 <div id="diskUsage" class="stat-value">0%</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">Ollama连接数</div>
+                <div class="stat-title">GPU Usage</div>
+                <div id="gpuUsage" class="stat-value">0%</div>
+                <div id="gpuName" class="stat-title">N/A</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">GPU Memory Usage</div>
+                <div id="gpuMemoryUsage" class="stat-value">0 MB / 0 MB</div>
+                <div id="gpuMemoryPercent" class="stat-title">0%</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">GPU Power</div>
+                <div id="gpuPower" class="stat-value">0 W / 0 W</div>
+                <div id="gpuPwrPercent" class="stat-title">0% (0°C)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">Ollama Connections</div>
                 <div id="ollamaConnections" class="stat-value">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">总输入Token</div>
+                <div class="stat-title">Total Input Tokens</div>
                 <div id="totalInputTokens" class="stat-value">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">总输出Token</div>
+                <div class="stat-title">Total Output Tokens</div>
                 <div id="totalOutputTokens" class="stat-value">0</div>
             </div>
         </div>
         
         <div class="nav-tabs">
-            <div class="tab active" data-target="charts">图表监控</div>
-            <div class="tab" data-target="models">模型统计</div>
-            <div class="tab" data-target="clients">客户端统计</div>
-            <div class="tab" data-target="requests">请求日志</div>
+            <div class="tab active" data-target="charts">Monitoring Charts</div>
+            <div class="tab" data-target="models">Model Statistics</div>
+            <div class="tab" data-target="clients">Client Statistics</div>
+            <div class="tab" data-target="requests">Request Logs</div>
         </div>
         
         <div class="tab-content">
             <div id="charts" class="active">
                 <div class="card">
-                    <h2>CPU使用率</h2>
+                    <h2>CPU Usage</h2>
                     <div class="chart-container">
                         <canvas id="cpuChart"></canvas>
                     </div>
                 </div>
                 
                 <div class="card">
-                    <h2>内存使用率</h2>
+                    <h2>Memory Usage</h2>
                     <div class="chart-container">
                         <canvas id="memoryChart"></canvas>
                     </div>
                 </div>
                 
                 <div class="card">
-                    <h2>网络流量</h2>
+                    <h2>GPU Usage</h2>
+                    <div class="chart-container">
+                        <canvas id="gpuChart"></canvas>
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <h2>Network Traffic</h2>
                     <div class="chart-container">
                         <canvas id="networkChart"></canvas>
                     </div>
                 </div>
                 
                 <div class="card">
-                    <h2>Token使用情况</h2>
+                    <h2>Token Usage</h2>
                     <div class="chart-container">
                         <canvas id="tokensChart"></canvas>
                     </div>
@@ -1128,20 +1344,20 @@ def get_index_template():
             
             <div id="models">
                 <div class="card">
-                    <h2>模型使用统计</h2>
+                    <h2>Model Usage Statistics</h2>
                     <table>
                         <thead>
                             <tr>
-                                <th>模型名称</th>
-                                <th>请求次数</th>
-                                <th>输入Token</th>
-                                <th>输出Token</th>
-                                <th>平均响应时间</th>
+                                <th>Model Name</th>
+                                <th>Request Count</th>
+                                <th>Input Tokens</th>
+                                <th>Output Tokens</th>
+                                <th>Average Response Time</th>
                             </tr>
                         </thead>
                         <tbody id="modelStatsBody">
                             <tr>
-                                <td colspan="5">加载中...</td>
+                                <td colspan="5">Loading...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -1150,17 +1366,17 @@ def get_index_template():
             
             <div id="clients">
                 <div class="card">
-                    <h2>客户端IP统计</h2>
+                    <h2>Client IP Statistics</h2>
                     <table>
                         <thead>
                             <tr>
-                                <th>客户端IP</th>
-                                <th>请求次数</th>
+                                <th>Client IP</th>
+                                <th>Request Count</th>
                             </tr>
                         </thead>
                         <tbody id="ipStatsBody">
                             <tr>
-                                <td colspan="2">加载中...</td>
+                                <td colspan="2">Loading...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -1169,23 +1385,23 @@ def get_index_template():
             
             <div id="requests">
                 <div class="card">
-                    <h2>最近请求日志</h2>
+                    <h2>Recent Request Logs</h2>
                     <table>
                         <thead>
                             <tr>
-                                <th>时间</th>
-                                <th>客户端IP</th>
-                                <th>模型</th>
-                                <th>输入Token</th>
-                                <th>输出Token</th>
-                                <th>响应时间</th>
-                                <th>状态码</th>
-                                <th>接口</th>
+                                <th>Time</th>
+                                <th>Client IP</th>
+                                <th>Model</th>
+                                <th>Input Tokens</th>
+                                <th>Output Tokens</th>
+                                <th>Response Time</th>
+                                <th>Status Code</th>
+                                <th>API</th>
                             </tr>
                         </thead>
                         <tbody id="requestLogsBody">
                             <tr>
-                                <td colspan="8">加载中...</td>
+                                <td colspan="8">Loading...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -1221,6 +1437,13 @@ def api_system_metrics():
     db = OllamaMetricsDB()
     hours = request.args.get('hours', 24, type=int)
     metrics = db.get_recent_system_metrics(hours)
+    return jsonify(metrics)
+
+@app.route('/api/metrics/gpu')
+def api_gpu_metrics():
+    db = OllamaMetricsDB()
+    hours = request.args.get('hours', 24, type=int)
+    metrics = db.get_recent_gpu_metrics(hours)
     return jsonify(metrics)
 
 @app.route('/api/logs/requests')
